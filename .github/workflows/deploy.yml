@@ -1,0 +1,20 @@
+name: Deploy to server
+
+on:
+  push:
+    branches: ["main"]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: SSH deploy
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            export APP_DIR="${{ secrets.DEPLOY_APP_DIR }}"
+            export BRANCH=main
+            bash "$APP_DIR/deploy.sh"

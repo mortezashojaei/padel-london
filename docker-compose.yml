@@ -1,0 +1,12 @@
+services:
+  playtomic-checker:
+    build: .
+    container_name: playtomic-checker
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./state:/data
+    # run every 30 minutes in a lightweight loop
+    command: >
+      sh -lc 'while true; do python app/main.py; sleep ${CHECK_INTERVAL_SECONDS:-1800}; done'
