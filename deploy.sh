@@ -19,8 +19,11 @@ docker compose build --pull
 # Ensure stale/conflicting containers don't block recreation
 # (can happen after interrupted deploys with old generated names)
 docker compose down --remove-orphans || true
-# Always attempt cleanup of fixed container name used in docker-compose.yml
+# Clean stale service containers that can survive interrupted deploys
+docker compose rm -sf || true
+# Backward-compat cleanup from older naming
 docker rm -f playtomic-checker >/dev/null 2>&1 || true
+docker rm -f padel-london-playtomic-checker-1 >/dev/null 2>&1 || true
 
 docker compose up -d --force-recreate
 
