@@ -249,6 +249,26 @@ def format_message(result: dict, priority_tenant_id: str) -> str:
     return "\n".join(lines)
 
 
+def _chunk_text(text: str, limit: int = 3500) -> List[str]:
+    if len(text) <= limit:
+        return [text]
+    chunks: List[str] = []
+    buf: List[str] = []
+    size = 0
+    for line in text.splitlines():
+        add = len(line) + 1
+        if size + add > limit and buf:
+            chunks.append("\n".join(buf))
+            buf = [line]
+            size = add
+        else:
+            buf.append(line)
+            size += add
+    if buf:
+        chunks.append("\n".join(buf))
+    return chunks
+
+
 def send_telegram(text: str):
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -256,8 +276,16 @@ def send_telegram(text: str):
         print("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set; skipping send")
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    r = requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=20)
-    r.raise_for_status()
+
+    parts = _chunk_text(text, 3500)
+    total = len(parts)
+    for i, part in enumerate(parts, start=1):
+        payload = {
+            "chat_id": chat_id,
+            "text": part if total == 1 else f"[{i}/{total}]\n{part}",
+        }
+        r = requests.post(url, json=payload, timeout=20)
+        r.raise_for_status()
 
 
 def main():
