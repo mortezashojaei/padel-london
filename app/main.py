@@ -201,12 +201,15 @@ def collect_slots(tenant_id: str, sport_id: str, days: int, start_hour: int, end
                     )
 
     qualifying.sort(key=lambda s: (s.date, s.start_time, s.resource_name))
+    slug = (tenant.get("slug") or "").strip()
+    booking_url = f"https://playtomic.com/clubs/{slug}" if slug else "https://playtomic.com/clubs"
+
     return {
         "club": tenant.get("tenant_name", "").strip(),
         "tenant_id": tenant_id,
         "sport_id": sport_id,
         "timezone": tz_name,
-        "booking_url": tenant.get("url") or f"https://playtomic.com/clubs/{tenant.get('slug','').strip()}",
+        "booking_url": booking_url,
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "days_scanned": days,
         "all_slots_seen": all_seen,
