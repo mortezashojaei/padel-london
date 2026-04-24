@@ -2,10 +2,11 @@
 import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import requests
 from zoneinfo import ZoneInfo
@@ -13,6 +14,7 @@ from zoneinfo import ZoneInfo
 PLAYTOMIC_WEB = "https://playtomic.com"
 PLAYTOMIC_API = "https://api.playtomic.io"
 STATE_FILE = Path(os.getenv("STATE_FILE", "/data/state.json"))
+DISCOVERY_CACHE_FILE = Path(os.getenv("DISCOVERY_CACHE_FILE", "/data/london_tenants_cache.json"))
 
 
 @dataclass
@@ -35,28 +37,104 @@ def env_int(name: str, default: int) -> int:
 def get_json(url: str, **kwargs):
     r = requests.get(url, timeout=20, **kwargs)
     r.raise_for_status()
-    return r.json()
+    return r.json(), r.headers
 
 
 def get_tenant(tenant_id: str) -> dict:
-    return get_json(f"{PLAYTOMIC_API}/v1/tenants/{tenant_id}")
+    data, _ = get_json(f"{PLAYTOMIC_API}/v1/tenants/{tenant_id}")
+    return data
 
 
 def get_resources(tenant_id: str) -> Dict[str, str]:
-    rows = get_json(f"{PLAYTOMIC_API}/v1/tenants/{tenant_id}/resources")
+    rows, _ = get_json(f"{PLAYTOMIC_API}/v1/tenants/{tenant_id}/resources")
     return {x["resource_id"]: x.get("name", x["resource_id"]).strip() for x in rows}
 
 
 def get_availability(tenant_id: str, sport_id: str, date_iso: str) -> list:
-    return get_json(
+    rows, _ = get_json(
         f"{PLAYTOMIC_WEB}/api/clubs/availability",
         params={"tenant_id": tenant_id, "sport_id": sport_id, "date": date_iso},
     )
+    return rows
 
 
 def outside_window(start_time_hms: str, start_hour: int, end_hour: int) -> bool:
     hour = int(start_time_hms.split(":", 1)[0])
     return hour < start_hour or hour >= end_hour
+
+
+def parse_last_page(link_header: str) -> int:
+    if not link_header:
+        return 0
+    m = re.search(r"page=(\d+)>; rel=\"last\"", link_header)
+    return int(m.group(1)) if m else 0
+
+
+def load_discovery_cache() -> dict:
+    if not DISCOVERY_CACHE_FILE.exists():
+        return {}
+    try:
+        return json.loads(DISCOVERY_CACHE_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def save_discovery_cache(payload: dict):
+    DISCOVERY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    DISCOVERY_CACHE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def discover_london_tenants(priority_tenant_id: str) -> List[str]:
+    refresh_hours = env_int("DISCOVERY_REFRESH_HOURS", 24)
+    max_pages = env_int("DISCOVERY_MAX_PAGES", 80)
+
+    cache = load_discovery_cache()
+    cached_at = cache.get("cached_at")
+    if cached_at:
+        try:
+            age = datetime.now(timezone.utc) - datetime.fromisoformat(cached_at)
+            if age.total_seconds() < refresh_hours * 3600 and cache.get("tenant_ids"):
+                ids = list(dict.fromkeys(cache["tenant_ids"]))
+                if priority_tenant_id and priority_tenant_id not in ids:
+                    ids.insert(0, priority_tenant_id)
+                return ids
+        except Exception:
+            pass
+
+    first_page, headers = get_json(f"{PLAYTOMIC_API}/v1/tenants", params={"page": 0})
+    last_page = min(parse_last_page(headers.get("Link", "")), max_pages - 1)
+
+    ids: List[str] = []
+
+    def add_from_rows(rows: list):
+        for t in rows:
+            a = t.get("address") or {}
+            city = (a.get("city") or "").strip().lower()
+            country = (a.get("country") or "").strip().lower()
+            status = (t.get("tenant_status") or "").strip().upper()
+            if status != "ACTIVE":
+                continue
+            if city == "london" and ("united kingdom" in country or country in {"uk", "gb", "great britain"}):
+                ids.append(t["tenant_id"])
+
+    add_from_rows(first_page)
+
+    for page in range(1, last_page + 1):
+        rows, _ = get_json(f"{PLAYTOMIC_API}/v1/tenants", params={"page": page})
+        add_from_rows(rows)
+
+    unique_ids = list(dict.fromkeys(ids))
+    if priority_tenant_id and priority_tenant_id not in unique_ids:
+        unique_ids.insert(0, priority_tenant_id)
+
+    save_discovery_cache(
+        {
+            "cached_at": datetime.now(timezone.utc).isoformat(),
+            "tenant_ids": unique_ids,
+            "count": len(unique_ids),
+        }
+    )
+    return unique_ids
 
 
 def collect_slots(tenant_id: str, sport_id: str, days: int, start_hour: int, end_hour: int) -> dict:
@@ -103,8 +181,35 @@ def collect_slots(tenant_id: str, sport_id: str, days: int, start_hour: int, end
     }
 
 
+def collect_all(tenant_ids: List[str], sport_id: str, days: int, start_hour: int, end_hour: int) -> dict:
+    clubs = []
+    total_seen = 0
+    for tid in tenant_ids:
+        try:
+            result = collect_slots(tid, sport_id, days, start_hour, end_hour)
+            total_seen += result["all_slots_seen"]
+            clubs.append(result)
+        except Exception as e:
+            clubs.append({"tenant_id": tid, "error": str(e), "club": f"tenant:{tid}", "qualifying_slots": [], "all_slots_seen": 0})
+
+    return {
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "sport_id": sport_id,
+        "days_scanned": days,
+        "total_slots_seen": total_seen,
+        "clubs_scanned": len(tenant_ids),
+        "clubs": clubs,
+    }
+
+
 def signature(payload: dict) -> str:
-    basis = json.dumps(payload.get("qualifying_slots", []), sort_keys=True, ensure_ascii=False)
+    # include club+slot to avoid duplicates across whole fleet
+    compact: List[Tuple[str, dict]] = []
+    for c in payload.get("clubs", []):
+        club = c.get("club", "")
+        for s in c.get("qualifying_slots", []):
+            compact.append((club, s))
+    basis = json.dumps(sorted(compact, key=lambda x: (x[0], x[1].get("date", ""), x[1].get("start_time", ""))), ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
 
@@ -122,19 +227,25 @@ def save_state(state: dict):
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2))
 
 
-def format_message(result: dict) -> str:
-    slots = result["qualifying_slots"]
+def format_message(result: dict, priority_tenant_id: str) -> str:
+    clubs = [c for c in result["clubs"] if c.get("qualifying_slots")]
+    clubs.sort(key=lambda c: (0 if c.get("tenant_id") == priority_tenant_id else 1, c.get("club", "")))
+
     lines = [
-        f"🎾 Playtomic alert — {result['club']} ({result['timezone']})",
+        "🎾 Playtomic alert — London clubs",
         "",
         "Out-of-hours slots (outside 08:00–18:00):",
     ]
-    for s in slots:
-        lines.append(
-            f"- {s['date']} {s['start_time'][:5]} — {s['duration']} min — {s['price']} ({s['resource_name']})"
-        )
-    lines.append("")
-    lines.append(f"Book: https://playtomic.com/clubs/powerleague-shoreditch")
+
+    for c in clubs:
+        is_priority = c.get("tenant_id") == priority_tenant_id
+        header = f"⭐ SHOREDITCH PRIORITY — {c['club']}" if is_priority else f"• {c['club']}"
+        lines.append("")
+        lines.append(header)
+        for s in c["qualifying_slots"]:
+            lines.append(f"  - {s['date']} {s['start_time'][:5]} — {s['duration']} min — {s['price']} ({s['resource_name']})")
+        lines.append(f"  Book: https://playtomic.com/clubs/{c.get('club','').strip().lower().replace(' ','-')}")
+
     return "\n".join(lines)
 
 
@@ -150,20 +261,31 @@ def send_telegram(text: str):
 
 
 def main():
-    tenant_id = os.getenv("PLAYTOMIC_TENANT_ID", "2ab75436-9bb0-4e9c-9a6f-b12931a9ca4a")
+    priority_tenant_id = os.getenv("PRIORITY_TENANT_ID", "2ab75436-9bb0-4e9c-9a6f-b12931a9ca4a")
     sport_id = os.getenv("PLAYTOMIC_SPORT_ID", "PADEL")
     days = env_int("DAYS_AHEAD", 7)
     start_hour = env_int("EXCLUDED_START_HOUR", 8)
     end_hour = env_int("EXCLUDED_END_HOUR", 18)
     dry_run = os.getenv("DRY_RUN", "false").lower() == "true"
+    monitor_mode = os.getenv("MONITOR_MODE", "single").strip().lower()
 
-    result = collect_slots(tenant_id, sport_id, days, start_hour, end_hour)
+    tenant_ids_env = [x.strip() for x in os.getenv("PLAYTOMIC_TENANT_IDS", "").split(",") if x.strip()]
+    if monitor_mode == "london_all":
+        tenant_ids = discover_london_tenants(priority_tenant_id)
+    elif tenant_ids_env:
+        tenant_ids = list(dict.fromkeys(tenant_ids_env + [priority_tenant_id]))
+    else:
+        tenant_ids = [os.getenv("PLAYTOMIC_TENANT_ID", priority_tenant_id)]
+
+    result = collect_all(tenant_ids, sport_id, days, start_hour, end_hour)
     print(json.dumps(result, ensure_ascii=False))
+
+    has_any = any(c.get("qualifying_slots") for c in result["clubs"])
 
     state = load_state()
     sig = signature(result)
 
-    if not result["qualifying_slots"]:
+    if not has_any:
         print("No qualifying slots.")
         state["last_signature"] = sig
         state["last_seen"] = result["checked_at"]
@@ -176,7 +298,7 @@ def main():
         save_state(state)
         return
 
-    msg = format_message(result)
+    msg = format_message(result, priority_tenant_id)
     if dry_run:
         print("DRY_RUN=true, would send:\n")
         print(msg)

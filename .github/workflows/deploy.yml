@@ -21,7 +21,10 @@ jobs:
             cat > "$APP_DIR/.env" << 'EOF'
             TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
             TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
+            MONITOR_MODE=london_all
+            PRIORITY_TENANT_ID=2ab75436-9bb0-4e9c-9a6f-b12931a9ca4a
             PLAYTOMIC_TENANT_ID=2ab75436-9bb0-4e9c-9a6f-b12931a9ca4a
+            PLAYTOMIC_TENANT_IDS=
             PLAYTOMIC_SPORT_ID=PADEL
             DAYS_AHEAD=7
             EXCLUDED_START_HOUR=8
