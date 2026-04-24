@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import hashlib
 import json
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -84,13 +85,33 @@ def save_discovery_cache(payload: dict):
     DISCOVERY_CACHE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
-def discover_london_tenants(priority_tenant_id: str) -> List[str]:
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371.0
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def discover_london_tenants(priority_tenant_id: str, nearby_only: bool = False) -> List[str]:
     refresh_hours = env_int("DISCOVERY_REFRESH_HOURS", 24)
     max_pages = env_int("DISCOVERY_MAX_PAGES", 80)
 
+    # 20 minutes in London traffic ~= 6km at ~18km/h by default
+    max_travel_minutes = env_int("MAX_TRAVEL_MINUTES", 20)
+    avg_speed_kmh = env_int("AVG_SPEED_KMH", 18)
+    max_distance_km = float(os.getenv("MAX_DISTANCE_KM", (max_travel_minutes / 60.0) * avg_speed_kmh))
+
+    anchor = get_tenant(priority_tenant_id)
+    c = ((anchor.get("address") or {}).get("coordinate") or {})
+    anchor_lat, anchor_lon = c.get("lat"), c.get("lon")
+
     cache = load_discovery_cache()
     cached_at = cache.get("cached_at")
-    if cached_at:
+    cache_key = f"nearby={nearby_only};max_km={max_distance_km:.2f}"
+    if cached_at and cache.get("cache_key") == cache_key:
         try:
             age = datetime.now(timezone.utc) - datetime.fromisoformat(cached_at)
             if age.total_seconds() < refresh_hours * 3600 and cache.get("tenant_ids"):
@@ -114,8 +135,18 @@ def discover_london_tenants(priority_tenant_id: str) -> List[str]:
             status = (t.get("tenant_status") or "").strip().upper()
             if status != "ACTIVE":
                 continue
-            if city == "london" and ("united kingdom" in country or country in {"uk", "gb", "great britain"}):
-                ids.append(t["tenant_id"])
+            if not (city == "london" and ("united kingdom" in country or country in {"uk", "gb", "great britain"})):
+                continue
+
+            if nearby_only and anchor_lat is not None and anchor_lon is not None:
+                cc = (a.get("coordinate") or {})
+                lat, lon = cc.get("lat"), cc.get("lon")
+                if lat is None or lon is None:
+                    continue
+                if haversine_km(anchor_lat, anchor_lon, lat, lon) > max_distance_km:
+                    continue
+
+            ids.append(t["tenant_id"])
 
     add_from_rows(first_page)
 
@@ -130,6 +161,7 @@ def discover_london_tenants(priority_tenant_id: str) -> List[str]:
     save_discovery_cache(
         {
             "cached_at": datetime.now(timezone.utc).isoformat(),
+            "cache_key": cache_key,
             "tenant_ids": unique_ids,
             "count": len(unique_ids),
         }
@@ -299,7 +331,9 @@ def main():
 
     tenant_ids_env = [x.strip() for x in os.getenv("PLAYTOMIC_TENANT_IDS", "").split(",") if x.strip()]
     if monitor_mode == "london_all":
-        tenant_ids = discover_london_tenants(priority_tenant_id)
+        tenant_ids = discover_london_tenants(priority_tenant_id, nearby_only=False)
+    elif monitor_mode == "london_nearby":
+        tenant_ids = discover_london_tenants(priority_tenant_id, nearby_only=True)
     elif tenant_ids_env:
         tenant_ids = list(dict.fromkeys(tenant_ids_env + [priority_tenant_id]))
     else:
