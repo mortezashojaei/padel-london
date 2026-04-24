@@ -1,7 +1,6 @@
 services:
   playtomic-checker:
     build: .
-    container_name: playtomic-checker
     restart: unless-stopped
     env_file:
       - .env
