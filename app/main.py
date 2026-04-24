@@ -206,6 +206,7 @@ def collect_slots(tenant_id: str, sport_id: str, days: int, start_hour: int, end
         "tenant_id": tenant_id,
         "sport_id": sport_id,
         "timezone": tz_name,
+        "booking_url": tenant.get("url") or f"https://playtomic.com/clubs/{tenant.get('slug','').strip()}",
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "days_scanned": days,
         "all_slots_seen": all_seen,
@@ -263,20 +264,39 @@ def format_message(result: dict, priority_tenant_id: str) -> str:
     clubs = [c for c in result["clubs"] if c.get("qualifying_slots")]
     clubs.sort(key=lambda c: (0 if c.get("tenant_id") == priority_tenant_id else 1, c.get("club", "")))
 
+    max_clubs = env_int("MAX_CLUBS_IN_ALERT", 6)
+    max_slots_per_club = env_int("MAX_SLOTS_PER_CLUB", 12)
+
     lines = [
-        "🎾 Playtomic alert — London clubs",
-        "",
-        "Out-of-hours slots (outside 08:00–18:00):",
+        "🎾 *Padel alert*",
+        "🕘 Out-of-hours slots (outside 08:00–18:00)",
     ]
 
-    for c in clubs:
+    shown_clubs = clubs[:max_clubs]
+    hidden_clubs = max(0, len(clubs) - len(shown_clubs))
+
+    for c in shown_clubs:
         is_priority = c.get("tenant_id") == priority_tenant_id
-        header = f"⭐ SHOREDITCH PRIORITY — {c['club']}" if is_priority else f"• {c['club']}"
+        badge = "⭐ *Shoreditch priority*" if is_priority else "📍"
         lines.append("")
-        lines.append(header)
-        for s in c["qualifying_slots"]:
-            lines.append(f"  - {s['date']} {s['start_time'][:5]} — {s['duration']} min — {s['price']} ({s['resource_name']})")
-        lines.append(f"  Book: https://playtomic.com/clubs/{c.get('club','').strip().lower().replace(' ','-')}")
+        lines.append(f"{badge} *{c['club']}*")
+
+        slots = c.get("qualifying_slots", [])[:max_slots_per_club]
+        for s in slots:
+            lines.append(
+                f"• {s['date']} {s['start_time'][:5]} · {s['duration']}m · {s['price']} · {s['resource_name']}"
+            )
+
+        hidden_slots = max(0, len(c.get("qualifying_slots", [])) - len(slots))
+        if hidden_slots:
+            lines.append(f"…and {hidden_slots} more slots")
+
+        book_url = c.get("booking_url") or "https://playtomic.com"
+        lines.append(f"🔗 Book: {book_url}")
+
+    if hidden_clubs:
+        lines.append("")
+        lines.append(f"…and {hidden_clubs} more nearby clubs")
 
     return "\n".join(lines)
 
@@ -315,6 +335,8 @@ def send_telegram(text: str):
         payload = {
             "chat_id": chat_id,
             "text": part if total == 1 else f"[{i}/{total}]\n{part}",
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True,
         }
         r = requests.post(url, json=payload, timeout=20)
         r.raise_for_status()
