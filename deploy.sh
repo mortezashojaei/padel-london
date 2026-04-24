@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+LOCK_FILE="/tmp/padel-london-deploy.lock"
+exec 9>"$LOCK_FILE"
+flock 9
+
 APP_DIR="${APP_DIR:-$HOME/playtomic-checker}"
 BRANCH="${BRANCH:-main}"
 
